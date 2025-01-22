@@ -726,9 +726,11 @@ _task_states = TaskStateStore()
 
 
 class _AsyncioTaskStatus(abc.TaskStatus):
-    def __init__(self, future: asyncio.Future, parent_id: int):
+    def __init__(self, future: asyncio.Future, parent_id: int, old_task_group: TaskGroup, new_task_group: TaskGroup):
         self._future = future
         self._parent_id = parent_id
+        self._old_task_group = old_task_group
+        self._new_task_group = new_task_group
 
     def started(self, value: T_contra | None = None) -> None:
         try:
@@ -740,7 +742,17 @@ class _AsyncioTaskStatus(abc.TaskStatus):
                 ) from None
 
         task = cast(asyncio.Task, current_task())
-        _task_states[task].parent_id = self._parent_id
+
+        task_state = _task_states[task]
+        task_state.parent_id = self._parent_id
+
+        self._old_task_group.cancel_scope._tasks.remove(task)
+        self._new_task_group.cancel_scope._tasks.add(task)
+
+        task_state.cancel_scope = self._new_task_group.cancel_scope
+
+        self._old_task_group._tasks.remove(task)
+        self._new_task_group._tasks.add(task)
 
 
 async def _wait(tasks: Iterable[asyncio.Task[object]]) -> None:
@@ -835,6 +847,7 @@ class TaskGroup(abc.TaskGroup):
         args: tuple[Unpack[PosArgsT]],
         name: object,
         task_status_future: asyncio.Future | None = None,
+        start_group: TaskGroup | None = None,
     ) -> asyncio.Task:
         def task_done(_task: asyncio.Task) -> None:
             # task_state = _task_states[_task]
@@ -881,7 +894,7 @@ class TaskGroup(abc.TaskGroup):
         if task_status_future:
             parent_id = id(current_task())
             kwargs["task_status"] = _AsyncioTaskStatus(
-                task_status_future, id(self.cancel_scope._host_task)
+                task_status_future, id(self.cancel_scope._host_task), old_task_group=start_group, new_task_group=self
             )
         else:
             parent_id = id(self.cancel_scope._host_task)
@@ -894,10 +907,16 @@ class TaskGroup(abc.TaskGroup):
                 f"the return value ({coro!r}) is not a coroutine object"
             )
 
-        # Make the spawned task inherit the task group's cancel scope
-        _task_states[coro] = task_state = TaskState(
-            parent_id=parent_id, cancel_scope=self.cancel_scope
-        )
+        # Make the spawned task inherit the task group's cancel scope unless we are in a start() context
+        if start_group:
+            _task_states[coro] = task_state = TaskState(
+                parent_id=parent_id, cancel_scope=start_group.cancel_scope
+            )
+        else:
+            _task_states[coro] = task_state = TaskState(
+                parent_id=parent_id, cancel_scope=self.cancel_scope
+            )
+
         name = get_callable_name(func) if name is None else str(name)
         try:
             task = create_task(coro, name=name)
@@ -905,8 +924,9 @@ class TaskGroup(abc.TaskGroup):
             del _task_states[coro]
 
         _task_states[task] = task_state
-        self.cancel_scope._tasks.add(task)
-        self._tasks.add(task)
+        if not task_status_future:
+            self.cancel_scope._tasks.add(task)
+            self._tasks.add(task)
 
         if task.done():
             # This can happen with eager task factories
@@ -928,21 +948,22 @@ class TaskGroup(abc.TaskGroup):
         self, func: Callable[..., Awaitable[Any]], *args: object, name: object = None
     ) -> Any:
         future: asyncio.Future = asyncio.Future()
-        task = self._spawn(func, args, name, future)
+        async with TaskGroup() as start_group:
+            task = self._spawn(func, args, name, future, start_group)
 
-        # If the task raises an exception after sending a start value without a switch
-        # point between, the task group is cancelled and this method never proceeds to
-        # process the completed future. That's why we have to have a shielded cancel
-        # scope here.
-        try:
-            return await future
-        except CancelledError:
-            # Cancel the task and wait for it to exit before returning
-            task.cancel()
-            with CancelScope(shield=True), suppress(CancelledError):
-                await task
+            # If the task raises an exception after sending a start value without a switch
+            # point between, the task group is cancelled and this method never proceeds to
+            # process the completed future. That's why we have to have a shielded cancel
+            # scope here.
+            try:
+                return await future
+            except CancelledError:
+                # Cancel the task and wait for it to exit before returning
+                task.cancel()
+                with CancelScope(shield=True), suppress(CancelledError):
+                    await task
 
-            raise
+                raise
 
 
 #
