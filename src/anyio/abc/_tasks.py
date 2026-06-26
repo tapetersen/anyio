@@ -20,9 +20,18 @@ else:
 if TYPE_CHECKING:
     from .._core._tasks import CancelScope, TaskHandle
 
-T_co = TypeVar("T_co", covariant=True)
+T_co = TypeVar("T_co", covariant=True, default=None)
+T_ret = TypeVar("T_ret", covariant=True, default=object)
 T_contra = TypeVar("T_contra", contravariant=True, default=None)
-PosArgsT = TypeVarTuple("PosArgsT")
+PosArgsT = TypeVarTuple("PosArgsT", default=Unpack[tuple])
+
+
+class _StatusTask(Protocol[T_ret, T_co, Unpack[PosArgsT]]):
+    def __call__(
+        self,
+        *args: Unpack[PosArgsT],
+        task_status: TaskStatus[T_co],
+    ) -> Coroutine[Any, Any, T_ret]: ...
 
 
 def get_callable_name(func: Callable, override: object = None) -> str:
@@ -104,11 +113,11 @@ class TaskGroup(metaclass=ABCMeta):
     @abstractmethod
     def create_task(
         self,
-        coro: Coroutine[Any, Any, T_co],
+        coro: Coroutine[Any, Any, T_ret],
         *,
         name: object = None,
         context: Context | None = None,
-    ) -> TaskHandle[T_co]:
+    ) -> TaskHandle[T_ret]:
         """
         Create a new task from a coroutine object and schedule it to run.
 
@@ -123,10 +132,10 @@ class TaskGroup(metaclass=ABCMeta):
     @final
     def start_soon(
         self,
-        func: Callable[[Unpack[PosArgsT]], Coroutine[Any, Any, T_co]],
+        func: Callable[[Unpack[PosArgsT]], Coroutine[Any, Any, T_ret]],
         *args: Unpack[PosArgsT],
         name: object = None,
-    ) -> TaskHandle[T_co]:
+    ) -> TaskHandle[T_ret]:
         """
         Start a new task in this task group.
 
@@ -146,29 +155,29 @@ class TaskGroup(metaclass=ABCMeta):
     @overload
     async def start(
         self,
-        func: Callable[..., Coroutine[Any, Any, T_co]],
-        *args: object,
+        func: _StatusTask[Any, T_co, Unpack[PosArgsT]],
+        *args: Unpack[PosArgsT],
         name: object = None,
         return_handle: Literal[False] = ...,
-    ) -> Any: ...
+    ) -> T_co: ...
 
     @overload
     async def start(
         self,
-        func: Callable[..., Coroutine[Any, Any, T_co]],
-        *args: object,
+        func: _StatusTask[T_ret, T_co, Unpack[PosArgsT]],
+        *args: Unpack[PosArgsT],
         name: object = None,
         return_handle: Literal[True],
-    ) -> TaskHandle[T_co, Any]: ...
+    ) -> TaskHandle[T_ret, T_co]: ...
 
     @abstractmethod
     async def start(
         self,
-        func: Callable[..., Coroutine[Any, Any, T_co]],
-        *args: object,
+        func: _StatusTask[T_ret, T_co, Unpack[PosArgsT]],
+        *args: Unpack[PosArgsT],
         name: object = None,
         return_handle: Literal[False] | Literal[True] = False,
-    ) -> Any:
+    ) -> T_co | TaskHandle[T_ret, T_co]:
         """
         Start a new task and wait until it signals for readiness.
 
