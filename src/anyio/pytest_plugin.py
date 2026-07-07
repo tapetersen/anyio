@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from asyncio import Event
+import asyncio
 import dataclasses
 import socket
 import sys
@@ -14,15 +16,16 @@ from _pytest.outcomes import Exit
 from _pytest.python import CallSpec2
 from _pytest.scope import Scope
 
-from . import get_available_backends
+from . import get_available_backends, create_task_group, TASK_STATUS_IGNORED
 from ._core._eventloop import (
     current_async_library,
     get_async_backend,
     reset_current_async_library,
     set_current_async_library,
+    sleep_forever,
 )
 from ._core._exceptions import iterate_exceptions
-from .abc import TestRunner
+from .abc import TestRunner, TaskGroup, TaskStatus
 
 if sys.version_info < (3, 11):
     from exceptiongroup import ExceptionGroup
@@ -372,4 +375,28 @@ def free_tcp_port(free_tcp_port_factory: Callable[[], int]) -> int:
 
 @pytest.fixture
 def free_udp_port(free_udp_port_factory: Callable[[], int]) -> int:
+    return free_udp_port_factory()
+
+@pytest.fixture(scope="session")
+async def task_group(anyio_backend_name: str) -> TaskGroup:
+    tg = create_task_group()
+    ev = Event()
+    async def run_fixture_tg():
+        nonlocal tg
+        async with create_task_group() as tg:
+            ev.set()
+            await sleep_forever()
+
+    if anyio_backend_name == "asyncio":
+        task = asyncio.create_task(run_fixture_tg())
+    else:
+        assert anyio_backend_name == "trio"
+        from trio.lowlevel import spawn_system_task
+        task = spawn_system_task(run_fixture_tg, name="anyio_pytest_fixture")
+
+    await ev.wait()
+
+    if anyio_backend_name == "asyncio":
+        task = 
+
     return free_udp_port_factory()
