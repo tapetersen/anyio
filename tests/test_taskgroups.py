@@ -395,6 +395,50 @@ async def test_no_spin_on_done_task_in_cancel_scope(mocker: MockerFixture) -> No
     assert scope._cancel_handle is None
     spy.assert_called_once()
 
+@pytest.mark.parametrize("anyio_backend", asyncio_params)
+async def test_warn_on_unclosed_scopes() -> None:
+    """Test that scope left open when their host-task finished emit a ResourceWarning."""
+
+    async def owner() -> None:
+        CancelScope().__enter__()
+        CancelScope().__enter__()
+
+    with pytest.warns(ResourceWarning, match="Unclosed <CancelScope") as records:
+        task = asyncio.create_task(owner())
+        await task
+        await checkpoint()
+
+    assert len(records) == 2
+
+
+def test_warn_on_top_level_task_finishing_with_unclosed_scope() -> None:
+    """The root task started by ``anyio.run()`` is checked the same way."""
+
+    async def main() -> None:
+        CancelScope().__enter__()
+
+    with pytest.warns(ResourceWarning, match="Unclosed <CancelScope"):
+        anyio.run(main, backend="asyncio")
+
+
+@pytest.mark.parametrize("anyio_backend", asyncio_params)
+async def test_no_warning_for_properly_closed_scopes(
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    """Correctly nested scopes must not trigger the new diagnostic."""
+
+    async def child() -> None:
+        with CancelScope():
+            await checkpoint()
+
+    async with create_task_group() as tg:
+        tg.start_soon(child)
+
+    with CancelScope():
+        await checkpoint()
+
+    assert not [w for w in recwarn.list if issubclass(w.category, ResourceWarning)]
+
 
 @pytest.mark.parametrize("return_handle", [False, True])
 async def test_start_exception_delivery(return_handle: bool) -> None:

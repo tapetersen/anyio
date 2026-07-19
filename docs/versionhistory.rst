@@ -3,6 +3,12 @@ Version history
 
 This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
+**UNRELEASED**
+
+- Added a ``ResourceWarning`` on the asyncio backend when a task finishes without
+  exiting one or more ``CancelScope``\ s it had entered, which previously failed
+  silently and could leak scope objects
+
 **4.14.2**
 
 - Changed ``ByteReceiveStream.receive()`` implementations to raise a ``ValueError`` when

@@ -9,6 +9,7 @@ import os
 import socket
 import sys
 import threading
+import warnings
 import weakref
 from asyncio import (
     AbstractEventLoop,
@@ -698,6 +699,26 @@ class CancelScope(BaseCancelScope):
                 self._restart_cancellation_in_parent()
 
 
+def _check_unclosed_scopes(task: asyncio.Task[object]) -> None:
+    """Warn about any cancel scopes ``task`` finished without exiting."""
+    state = _task_states.get(task)
+    scope = state.cancel_scope if state else None
+    while scope is not None and scope._host_task is task:
+        scope._tasks.discard(task)
+        parent = scope._parent_scope
+        if not scope._tasks and parent is not None:
+            parent._child_scopes.remove(scope)
+            
+        scope = parent
+        warnings.warn(
+            f"Unclosed <CancelScope at {id(scope):x}> (task {task.get_name()!r} "
+            "finished without exiting it)",
+            ResourceWarning,
+            stacklevel=1,
+            source=scope,
+        )
+
+
 #
 # Task states
 #
@@ -716,7 +737,7 @@ class TaskState:
         self.cancel_scope = cancel_scope
 
 
-_task_states: WeakKeyDictionary[asyncio.Task, TaskState] = WeakKeyDictionary()
+_task_states: WeakKeyDictionary[asyncio.Task[object], TaskState] = WeakKeyDictionary()
 
 
 #
@@ -838,6 +859,8 @@ class TaskGroup(abc.TaskGroup):
                 asyncio.future_discard_from_awaited_by(
                     _task, self.cancel_scope._host_task
                 )
+
+            _check_unclosed_scopes(_task)
 
             task_state = _task_states[_task]
             assert task_state.cancel_scope is not None
@@ -2463,6 +2486,7 @@ class AsyncIOBackend(AsyncBackend):
             try:
                 return await func(*args)
             finally:
+                _check_unclosed_scopes(task)
                 del _task_states[task]
 
         debug = options.get("debug", None)
@@ -2671,6 +2695,7 @@ class AsyncIOBackend(AsyncBackend):
                 raise concurrent.futures.CancelledError(str(exc)) from None
             finally:
                 if scope is not None:
+                    _check_unclosed_scopes(task)
                     scope._tasks.discard(task)
 
         loop = cast(
