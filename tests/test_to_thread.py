@@ -6,8 +6,9 @@ import sys
 import threading
 import time
 import weakref
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextvars import ContextVar
+from contextvars import Context, ContextVar
 from functools import partial
 from typing import Any, NoReturn
 
@@ -28,6 +29,13 @@ from anyio.from_thread import BlockingPortalProvider
 from anyio.lowlevel import checkpoint
 
 from .conftest import asyncio_params, no_other_refs
+
+if sys.version_info >= (3, 11):
+    from typing import TypeVarTuple, Unpack
+else:
+    from typing_extensions import TypeVarTuple, Unpack
+
+PosArgsT = TypeVarTuple("PosArgsT")
 
 
 async def test_run_in_thread_cancelled() -> None:
@@ -417,83 +425,200 @@ def test_asyncio_run_does_not_leak_event_loop() -> None:
     assert loop_ref() is None
 
 
+class DeliveryTrackingEventLoop(asyncio.SelectorEventLoop):
+    """
+    Event loop that keeps track of how worker threads deliver their results.
+
+    As ``call_soon_threadsafe()`` is called from the worker thread itself, this records
+    what the worker thread did without having to patch anything.
+
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.deliveries_after_close = 0
+        self.fail_deliveries = False
+
+    def call_soon_threadsafe(
+        self,
+        callback: Callable[[Unpack[PosArgsT]], object],
+        *args: Unpack[PosArgsT],
+        context: Context | None = None,
+    ) -> asyncio.Handle:
+        if self.is_closed():
+            self.deliveries_after_close += 1
+        elif self.fail_deliveries:
+            raise RuntimeError("Unrelated error")
+
+        return super().call_soon_threadsafe(callback, *args, context=context)
+
+
+@pytest.fixture
+def worker_thread_exceptions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[BaseException | None]:
+    """
+    Collect the exceptions raised in worker threads.
+
+    Without this, exceptions in worker threads are only reported indirectly, as
+    unhandled thread exception warnings from pytest.
+
+    """
+    exceptions: list[BaseException | None] = []
+    monkeypatch.setattr(
+        threading, "excepthook", lambda args: exceptions.append(args.exc_value)
+    )
+    return exceptions
+
+
+def abandon_worker_threads(
+    loop: DeliveryTrackingEventLoop,
+    thread_count: int,
+    thread_worker: Callable[[], object],
+) -> Callable[[], None]:
+    """
+    Run ``thread_count`` worker threads on ``loop``, and abandon them by cancelling
+    their tasks while they are still inside ``thread_worker``.
+
+    Returns a function that waits for the abandoned threads to exit.
+
+    """
+    started = threading.Barrier(thread_count + 1)
+
+    def run_thread_worker() -> None:
+        started.wait(5)
+        thread_worker()
+
+    async def main() -> None:
+        limiter = CapacityLimiter(thread_count + 1)
+        async with create_task_group() as tg:
+            for _ in range(thread_count):
+                tg.start_soon(
+                    partial(
+                        to_thread.run_sync, abandon_on_cancel=True, limiter=limiter
+                    ),
+                    run_thread_worker,
+                )
+
+            # Wait until every worker thread is actually running its target function, as
+            # a task that is cancelled before that never reports a result at all
+            await to_thread.run_sync(started.wait, 5, limiter=limiter)
+            tg.cancel_scope.cancel()
+
+    loop.run_until_complete(main())
+
+    def join_threads() -> None:
+        for thread in threading.enumerate():
+            if thread.name == "AnyIO worker thread":
+                thread.join(5)
+                assert not thread.is_alive()
+
+    return join_threads
+
+
 def test_asyncio_report_result_after_loop_closed(
-    asyncio_event_loop: asyncio.AbstractEventLoop,
+    worker_thread_exceptions: list[BaseException | None],
 ) -> None:
     """
     Test that a worker thread, abandoned on cancellation, does not raise a RuntimeError
     when it delivers its result after the event loop has been closed.
 
     """
-    thread_started = threading.Event()
-    finish_thread = threading.Event()
+    loop = DeliveryTrackingEventLoop()
+    release = threading.Event()
+    join_threads = abandon_worker_threads(loop, 1, partial(release.wait, 5))
+    loop.close()
 
-    def thread_worker() -> None:
-        thread_started.set()
-        finish_thread.wait(5)
+    # Let the abandoned worker report its result to the now closed event loop
+    release.set()
+    join_threads()
 
-    async def main() -> None:
-        async with create_task_group() as tg:
-            tg.start_soon(
-                partial(to_thread.run_sync, abandon_on_cancel=True), thread_worker
-            )
-            await to_thread.run_sync(thread_started.wait, 5)
-            tg.cancel_scope.cancel()
-
-    asyncio_event_loop.run_until_complete(main())
-    asyncio_event_loop.close()
-
-    # Let the abandoned worker report its result to the now closed event loop.
-    # Any exception raised in the worker thread fails the test via pytest's unhandled
-    # thread exception warning.
-    finish_thread.set()
-    for thread in threading.enumerate():
-        if thread.name == "AnyIO worker thread":
-            thread.join(5)
-            assert not thread.is_alive()
+    assert loop.deliveries_after_close == 1
+    assert not worker_thread_exceptions
 
 
 def test_asyncio_report_result_unrelated_runtime_error(
-    asyncio_event_loop: asyncio.AbstractEventLoop, monkeypatch: pytest.MonkeyPatch
+    worker_thread_exceptions: list[BaseException | None],
 ) -> None:
     """
     Test that a RuntimeError raised while reporting the result of a worker thread is not
     suppressed when the event loop is still open.
 
     """
-    thread_started = threading.Event()
-    finish_thread = threading.Event()
-    exceptions: list[BaseException | None] = []
-
-    def thread_worker() -> None:
-        thread_started.set()
-        finish_thread.wait(5)
-
-    def call_soon_threadsafe(*args: object) -> NoReturn:
-        raise RuntimeError("Unrelated error")
-
-    async def main() -> None:
-        async with create_task_group() as tg:
-            tg.start_soon(
-                partial(to_thread.run_sync, abandon_on_cancel=True), thread_worker
-            )
-            await to_thread.run_sync(thread_started.wait, 5)
-            tg.cancel_scope.cancel()
-
-    asyncio_event_loop.run_until_complete(main())
-    monkeypatch.setattr(
-        asyncio_event_loop, "call_soon_threadsafe", call_soon_threadsafe
-    )
-    monkeypatch.setattr(
-        threading, "excepthook", lambda args: exceptions.append(args.exc_value)
-    )
+    loop = DeliveryTrackingEventLoop()
+    release = threading.Event()
+    join_threads = abandon_worker_threads(loop, 1, partial(release.wait, 5))
+    loop.fail_deliveries = True
 
     # Let the abandoned worker report its result to the still open event loop
-    finish_thread.set()
-    for thread in threading.enumerate():
-        if thread.name == "AnyIO worker thread":
-            thread.join(5)
+    release.set()
+    join_threads()
+    loop.close()
 
-    assert len(exceptions) == 1
-    assert isinstance(exceptions[0], RuntimeError)
-    assert str(exceptions[0]) == "Unrelated error"
+    assert len(worker_thread_exceptions) == 1
+    assert isinstance(worker_thread_exceptions[0], RuntimeError)
+    assert str(worker_thread_exceptions[0]) == "Unrelated error"
+
+
+def close_loop_while_reporting_results(thread_count: int) -> int:
+    """
+    Close an event loop at the very moment ``thread_count`` abandoned worker threads
+    return from their target function.
+
+    Returns the number of results that were delivered after the loop was closed.
+
+    """
+    loop = DeliveryTrackingEventLoop()
+    release = threading.Event()
+    close_at = 0.0
+
+    def thread_worker() -> None:
+        release.wait(5)
+        # Spin on the clock rather than waiting for another event: a worker thread that
+        # has to be woken up by the OS always arrives long after the loop was closed
+        while time.perf_counter() < close_at:
+            pass
+
+    join_threads = abandon_worker_threads(loop, thread_count, thread_worker)
+
+    # Give the worker threads a moment to start spinning, and close the loop just as
+    # they return from their target function
+    close_at = time.perf_counter() + 0.001
+    release.set()
+    while time.perf_counter() < close_at:
+        pass
+
+    loop.close()
+    join_threads()
+    return loop.deliveries_after_close
+
+
+def test_asyncio_report_result_loop_close_race(
+    worker_thread_exceptions: list[BaseException | None],
+) -> None:
+    """
+    Stress test for the race between the event loop being closed and an abandoned worker
+    thread delivering its result.
+
+    Unlike the two tests above, this one aims at the race itself rather than at its
+    outcome, but it can only hit it by chance: on an 8 core CPU it reproduces the
+    pre-fix RuntimeError roughly once per 1000 abandoned worker threads, so this is a
+    best effort test that gets weaker on slower machines.
+
+    """
+    deliveries_after_close = 0
+    deadline = time.perf_counter() + 5
+    old_switch_interval = sys.getswitchinterval()
+    # The race window is only a couple of bytecodes wide, so the interpreter has to be
+    # told to switch threads far more eagerly than it does by default (with the default
+    # switch interval, the window is never hit at all)
+    sys.setswitchinterval(1e-6)
+    try:
+        while time.perf_counter() < deadline and not worker_thread_exceptions:
+            deliveries_after_close += close_loop_while_reporting_results(16)
+    finally:
+        sys.setswitchinterval(old_switch_interval)
+
+    assert not worker_thread_exceptions
+    # Fail instead of passing vacuously if the threads never got to race the loop
+    assert deliveries_after_close
